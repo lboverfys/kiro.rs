@@ -204,6 +204,7 @@ pub async fn post_messages(
     };
 
     tracing::debug!("Kiro request body: {}", request_body);
+    let malformed_snapshot = build_malformed_request_snapshot(&payload, &request_body);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -228,12 +229,134 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            "/v1/messages",
+            &malformed_snapshot,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            "/v1/messages",
+            &malformed_snapshot,
+        )
+        .await
     }
+}
+
+fn is_upstream_bad_request(err_msg: &str) -> bool {
+    err_msg.contains("400 Bad Request")
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn summarize_message_content(content: &serde_json::Value) -> serde_json::Value {
+    match content {
+        serde_json::Value::String(text) => json!({
+            "kind": "string",
+            "text_len": text.chars().count()
+        }),
+        serde_json::Value::Array(items) => {
+            let mut block_types: Vec<String> = Vec::new();
+            let mut tool_use_ids: Vec<String> = Vec::new();
+            let mut tool_result_use_ids: Vec<String> = Vec::new();
+
+            for item in items {
+                if let Some(obj) = item.as_object() {
+                    let block_type = obj
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    block_types.push(block_type.to_string());
+
+                    if block_type == "tool_use" {
+                        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                            tool_use_ids.push(id.to_string());
+                        }
+                    }
+
+                    if block_type == "tool_result" {
+                        if let Some(id) = obj.get("tool_use_id").and_then(|v| v.as_str()) {
+                            tool_result_use_ids.push(id.to_string());
+                        }
+                    }
+                } else {
+                    block_types.push(format!("non_object:{}", json_value_kind(item)));
+                }
+            }
+
+            json!({
+                "kind": "array",
+                "block_count": items.len(),
+                "block_types": block_types,
+                "tool_use_ids": tool_use_ids,
+                "tool_result_use_ids": tool_result_use_ids
+            })
+        }
+        serde_json::Value::Object(obj) => {
+            let keys: Vec<String> = obj.keys().take(8).cloned().collect();
+            json!({
+                "kind": "object",
+                "keys": keys
+            })
+        }
+        _ => json!({
+            "kind": json_value_kind(content)
+        }),
+    }
+}
+
+fn build_malformed_request_snapshot(payload: &MessagesRequest, request_body: &str) -> String {
+    let total_messages = payload.messages.len();
+    let recent_start = total_messages.saturating_sub(3);
+
+    let recent_messages: Vec<serde_json::Value> = payload
+        .messages
+        .iter()
+        .enumerate()
+        .skip(recent_start)
+        .map(|(idx, msg)| {
+            json!({
+                "index": idx,
+                "role": msg.role,
+                "content": summarize_message_content(&msg.content)
+            })
+        })
+        .collect();
+
+    let snapshot = json!({
+        "model": payload.model.as_str(),
+        "stream": payload.stream,
+        "max_tokens": payload.max_tokens,
+        "message_count": total_messages,
+        "system_count": payload.system.as_ref().map(|s| s.len()).unwrap_or(0),
+        "tools_count": payload.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        "has_tool_choice": payload.tool_choice.is_some(),
+        "thinking_type": payload.thinking.as_ref().map(|t| t.thinking_type.as_str()),
+        "has_output_config": payload.output_config.is_some(),
+        "metadata_user_id_present": payload
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_ref())
+            .is_some(),
+        "request_body_len": request_body.len(),
+        "recent_messages": recent_messages
+    });
+
+    serde_json::to_string(&snapshot)
+        .unwrap_or_else(|_| "{\"snapshot_error\":\"serialize_failed\"}".to_string())
 }
 
 /// 处理流式请求
@@ -243,17 +366,37 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    endpoint: &'static str,
+    malformed_snapshot: &str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::error!("Kiro API 调用失败: {}", e);
+            let err_msg = e.to_string();
+            if is_upstream_bad_request(&err_msg) {
+                tracing::warn!(
+                    endpoint = endpoint,
+                    model = %model,
+                    error = %err_msg,
+                    request_body = %request_body,
+                    snapshot = %malformed_snapshot,
+                    "上游返回 400，输出完整请求体和格式快照"
+                );
+            }
+            tracing::error!(
+                endpoint = endpoint,
+                model = %model,
+                error = %err_msg,
+                request_body = %request_body,
+                snapshot = %malformed_snapshot,
+                "Kiro API 调用失败（含完整请求体）"
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", e),
+                    format!("上游 API 调用失败: {}", err_msg),
                 )),
             )
                 .into_response();
@@ -388,17 +531,37 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    endpoint: &'static str,
+    malformed_snapshot: &str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::error!("Kiro API 调用失败: {}", e);
+            let err_msg = e.to_string();
+            if is_upstream_bad_request(&err_msg) {
+                tracing::warn!(
+                    endpoint = endpoint,
+                    model = %model,
+                    error = %err_msg,
+                    request_body = %request_body,
+                    snapshot = %malformed_snapshot,
+                    "上游返回 400，输出完整请求体和格式快照"
+                );
+            }
+            tracing::error!(
+                endpoint = endpoint,
+                model = %model,
+                error = %err_msg,
+                request_body = %request_body,
+                snapshot = %malformed_snapshot,
+                "Kiro API 调用失败（含完整请求体）"
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", e),
+                    format!("上游 API 调用失败: {}", err_msg),
                 )),
             )
                 .into_response();
@@ -704,6 +867,7 @@ pub async fn post_messages_cc(
     };
 
     tracing::debug!("Kiro request body: {}", request_body);
+    let malformed_snapshot = build_malformed_request_snapshot(&payload, &request_body);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -728,11 +892,21 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            "/cc/v1/messages",
+            &malformed_snapshot,
         )
         .await
     } else {
         // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            "/cc/v1/messages",
+            &malformed_snapshot,
+        )
+        .await
     }
 }
 
@@ -746,17 +920,37 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    endpoint: &'static str,
+    malformed_snapshot: &str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::error!("Kiro API 调用失败: {}", e);
+            let err_msg = e.to_string();
+            if is_upstream_bad_request(&err_msg) {
+                tracing::warn!(
+                    endpoint = endpoint,
+                    model = %model,
+                    error = %err_msg,
+                    request_body = %request_body,
+                    snapshot = %malformed_snapshot,
+                    "上游返回 400，输出完整请求体和格式快照"
+                );
+            }
+            tracing::error!(
+                endpoint = endpoint,
+                model = %model,
+                error = %err_msg,
+                request_body = %request_body,
+                snapshot = %malformed_snapshot,
+                "Kiro API 调用失败（含完整请求体）"
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", e),
+                    format!("上游 API 调用失败: {}", err_msg),
                 )),
             )
                 .into_response();
