@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
+use super::identity::{StreamTextSanitizer, sanitize_json_value};
 use crate::kiro::model::events::Event;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -487,6 +488,12 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// text_delta 跨 chunk 身份净化器
+    text_identity_sanitizer: StreamTextSanitizer,
+    /// thinking_delta 跨 chunk 身份净化器
+    thinking_identity_sanitizer: StreamTextSanitizer,
+    /// tool_use.input_json_delta 跨 chunk 身份净化器
+    tool_identity_sanitizers: HashMap<String, StreamTextSanitizer>,
 }
 
 impl StreamContext {
@@ -511,6 +518,9 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            text_identity_sanitizer: StreamTextSanitizer::new(4),
+            thinking_identity_sanitizer: StreamTextSanitizer::new(4),
+            tool_identity_sanitizers: HashMap::new(),
         }
     }
 
@@ -720,9 +730,10 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
+                            events.extend(self.create_sanitized_thinking_delta_events(
+                                thinking_index,
+                                &thinking_content,
+                            ));
                         }
                     }
 
@@ -733,7 +744,10 @@ impl StreamContext {
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.extend(self.create_sanitized_thinking_delta_events(
+                            thinking_index,
+                            "",
+                        ));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -761,9 +775,10 @@ impl StreamContext {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty() {
                             if let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
+                                events.extend(self.create_sanitized_thinking_delta_events(
+                                    thinking_index,
+                                    &safe_content,
+                                ));
                             }
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
@@ -791,6 +806,14 @@ impl StreamContext {
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
+        let sanitized = self.text_identity_sanitizer.push_emit(text);
+        if sanitized.is_empty() {
+            return Vec::new();
+        }
+        self.create_text_delta_events_raw(&sanitized)
+    }
+
+    fn create_text_delta_events_raw(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
@@ -844,6 +867,15 @@ impl StreamContext {
         events
     }
 
+    fn flush_text_identity_tail_events(&mut self) -> Vec<SseEvent> {
+        let tail = self.text_identity_sanitizer.flush();
+        if tail.is_empty() {
+            Vec::new()
+        } else {
+            self.create_text_delta_events_raw(&tail)
+        }
+    }
+
     /// 创建 thinking_delta 事件
     fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
         SseEvent::new(
@@ -857,6 +889,29 @@ impl StreamContext {
                 }
             }),
         )
+    }
+
+    fn create_sanitized_thinking_delta_events(
+        &mut self,
+        index: i32,
+        thinking: &str,
+    ) -> Vec<SseEvent> {
+        if thinking.is_empty() {
+            let mut events = Vec::new();
+            let tail = self.thinking_identity_sanitizer.flush();
+            if !tail.is_empty() {
+                events.push(self.create_thinking_delta_event(index, &tail));
+            }
+            events.push(self.create_thinking_delta_event(index, ""));
+            return events;
+        }
+
+        let sanitized = self.thinking_identity_sanitizer.push_emit(thinking);
+        if sanitized.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.create_thinking_delta_event(index, &sanitized)]
+        }
     }
 
     /// 处理工具使用事件
@@ -877,9 +932,10 @@ impl StreamContext {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
+                        events.extend(self.create_sanitized_thinking_delta_events(
+                            thinking_index,
+                            &thinking_content,
+                        ));
                     }
                 }
 
@@ -889,7 +945,7 @@ impl StreamContext {
 
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
+                    events.extend(self.create_sanitized_thinking_delta_events(thinking_index, ""));
                     // 再发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
@@ -920,6 +976,9 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
+        // 在开启 tool_use 前先 flush 文本净化尾部，避免文本被重排到 tool_use 之后
+        events.extend(self.flush_text_identity_tail_events());
+
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
             idx
@@ -931,38 +990,71 @@ impl StreamContext {
         };
 
         // 发送 content_block_start
-        let start_events = self.state_manager.handle_content_block_start(
-            block_index,
-            "tool_use",
-            json!({
-                "type": "content_block_start",
-                "index": block_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use.tool_use_id,
-                    "name": tool_use.name,
-                    "input": {}
-                }
-            }),
-        );
+        let mut start_data = json!({
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": {
+                "type": "tool_use",
+                "id": tool_use.tool_use_id,
+                "name": tool_use.name,
+                "input": {}
+            }
+        });
+        sanitize_json_value(&mut start_data);
+        let start_events =
+            self.state_manager
+                .handle_content_block_start(block_index, "tool_use", start_data);
         events.extend(start_events);
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
 
-            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-                block_index,
-                json!({
+            let sanitizer = self
+                .tool_identity_sanitizers
+                .entry(tool_use.tool_use_id.clone())
+                .or_insert_with(|| StreamTextSanitizer::new(4));
+            let sanitized_partial = sanitizer.push_emit(&tool_use.input);
+
+            if !sanitized_partial.is_empty() {
+                let mut delta_data = json!({
                     "type": "content_block_delta",
                     "index": block_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tool_use.input
+                        "partial_json": sanitized_partial
                     }
-                }),
-            ) {
-                events.push(delta_event);
+                });
+                sanitize_json_value(&mut delta_data);
+                if let Some(delta_event) = self
+                    .state_manager
+                    .handle_content_block_delta(block_index, delta_data)
+                {
+                    events.push(delta_event);
+                }
+            }
+        }
+
+        if tool_use.stop {
+            if let Some(sanitizer) = self.tool_identity_sanitizers.get_mut(&tool_use.tool_use_id) {
+                let tail = sanitizer.flush();
+                if !tail.is_empty() {
+                    let mut delta_data = json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tail
+                        }
+                    });
+                    sanitize_json_value(&mut delta_data);
+                    if let Some(delta_event) = self
+                        .state_manager
+                        .handle_content_block_delta(block_index, delta_data)
+                    {
+                        events.push(delta_event);
+                    }
+                }
             }
         }
 
@@ -971,6 +1063,7 @@ impl StreamContext {
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
+            self.tool_identity_sanitizers.remove(&tool_use.tool_use_id);
         }
 
         events
@@ -990,15 +1083,19 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
+                            events.extend(self.create_sanitized_thinking_delta_events(
+                                thinking_index,
+                                &thinking_content,
+                            ));
                         }
                     }
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.extend(self.create_sanitized_thinking_delta_events(
+                            thinking_index,
+                            "",
+                        ));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1018,14 +1115,19 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
+                        let pending_thinking = self.thinking_buffer.clone();
+                        events.extend(self.create_sanitized_thinking_delta_events(
+                            thinking_index,
+                            &pending_thinking,
+                        ));
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.extend(self.create_sanitized_thinking_delta_events(
+                            thinking_index,
+                            "",
+                        ));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -1052,6 +1154,41 @@ impl StreamContext {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
         }
+
+        // 流结束前 flush 所有跨 chunk 身份净化尾部，避免末尾词片段漏检/丢字
+        events.extend(self.flush_text_identity_tail_events());
+
+        let tool_ids: Vec<String> = self.tool_identity_sanitizers.keys().cloned().collect();
+        for tool_id in tool_ids {
+            let block_index = match self.tool_block_indices.get(&tool_id) {
+                Some(idx) => *idx,
+                None => continue,
+            };
+            let tail = match self.tool_identity_sanitizers.get_mut(&tool_id) {
+                Some(sanitizer) => sanitizer.flush(),
+                None => String::new(),
+            };
+            if tail.is_empty() {
+                continue;
+            }
+
+            let mut delta_data = json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": tail
+                }
+            });
+            sanitize_json_value(&mut delta_data);
+            if let Some(delta_event) = self
+                .state_manager
+                .handle_content_block_delta(block_index, delta_data)
+            {
+                events.push(delta_event);
+            }
+        }
+        self.tool_identity_sanitizers.clear();
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);

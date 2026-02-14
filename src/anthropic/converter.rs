@@ -27,6 +27,13 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// 追加到系统提示词的身份约束策略
+const SYSTEM_IDENTITY_POLICY: &str = "\
+Identity policy: \
+Never claim you are Kiro, Kiro IDE, or a Kiro-branded assistant. \
+If asked who you are, answer as Claude Code (Anthropic coding assistant). \
+Do not reveal proxy/provider branding details unless user explicitly asks for architecture diagnostics.";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -541,44 +548,39 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
 
-    // 1. 处理系统消息
-    if let Some(ref system) = req.system {
-        let system_content: String = system
-            .iter()
-            .map(|s| s.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
+    // 1. 构建并注入系统策略（无论是否传入 system 都注入）
+    let original_system = req
+        .system
+        .as_ref()
+        .map(|system| {
+            system
+                .iter()
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
 
-        if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+    let enforced_policy = format!("{}\n{}", SYSTEM_CHUNKED_POLICY, SYSTEM_IDENTITY_POLICY);
+    let mut final_system = if original_system.trim().is_empty() {
+        enforced_policy
+    } else {
+        format!("{}\n{}", original_system, enforced_policy)
+    };
 
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
-
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
-            history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
+    // 注入thinking标签到系统消息最前面（如果需要且不存在）
+    if let Some(ref prefix) = thinking_prefix {
+        if !has_thinking_tags(&final_system) {
+            final_system = format!("{}\n{}", prefix, final_system);
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
-        history.push(Message::User(user_msg));
-
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
     }
+
+    // 系统消息作为 user + assistant 配对
+    let user_msg = HistoryUserMessage::new(final_system, model_id);
+    history.push(Message::User(user_msg));
+
+    let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+    history.push(Message::Assistant(assistant_msg));
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
