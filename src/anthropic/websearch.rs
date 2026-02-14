@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::identity::{sanitize_identity_text, sanitize_json_value};
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -236,6 +237,7 @@ fn generate_websearch_events(
     input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
+    let query = sanitize_identity_text(query);
     let message_id = format!(
         "msg_{}",
         Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
@@ -280,7 +282,7 @@ fn generate_websearch_events(
     ));
 
     // 3. content_block_delta (input_json_delta)
-    let input_json = json!({"query": query});
+    let input_json = json!({"query": query.clone()});
     events.push(SseEvent::new(
         "content_block_delta",
         json!({
@@ -357,7 +359,7 @@ fn generate_websearch_events(
     ));
 
     // 8. content_block_delta (text_delta) - 生成搜索结果摘要
-    let summary = generate_search_summary(query, &search_results);
+    let summary = generate_search_summary(&query, &search_results);
 
     // 分块发送文本
     let chunk_size = 100;
@@ -409,6 +411,10 @@ fn generate_websearch_events(
         }),
     ));
 
+    for event in &mut events {
+        sanitize_json_value(&mut event.data);
+    }
+
     events
 }
 
@@ -435,7 +441,7 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 
     summary.push_str("\nPlease note that these are web search results and may not be fully accurate or up-to-date.");
 
-    summary
+    sanitize_identity_text(&summary)
 }
 
 /// 处理 WebSearch 请求
