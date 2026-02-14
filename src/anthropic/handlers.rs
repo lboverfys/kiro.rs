@@ -21,6 +21,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
+use super::identity::{sanitize_error_message_for_user, sanitize_identity_text, sanitize_json_value};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
@@ -136,7 +137,7 @@ pub async fn post_messages(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
                     "service_unavailable",
-                    "Kiro API provider not configured",
+                    "Upstream API provider not configured",
                 )),
             )
                 .into_response();
@@ -196,7 +197,7 @@ pub async fn post_messages(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
-                    format!("序列化请求失败: {}", e),
+                    sanitize_error_message_for_user(&e.to_string()),
                 )),
             )
                 .into_response();
@@ -396,7 +397,8 @@ async fn handle_stream_request(
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", err_msg),
+                    //format!("上游 API 调用失败: {}", err_msg),
+                    sanitize_error_message_for_user(&e.to_string()),
                 )),
             )
                 .into_response();
@@ -561,7 +563,7 @@ async fn handle_non_stream_request(
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", err_msg),
+                    sanitize_error_message_for_user(&e.to_string()),
                 )),
             )
                 .into_response();
@@ -577,7 +579,7 @@ async fn handle_non_stream_request(
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("读取响应失败: {}", e),
+                    sanitize_error_message_for_user(&e.to_string()),
                 )),
             )
                 .into_response();
@@ -629,12 +631,14 @@ async fn handle_non_stream_request(
                                         serde_json::json!({})
                                     });
 
-                                tool_uses.push(json!({
+                                let mut tool_item = json!({
                                     "type": "tool_use",
                                     "id": tool_use.tool_use_id,
                                     "name": tool_use.name,
                                     "input": input
-                                }));
+                                });
+                                sanitize_json_value(&mut tool_item);
+                                tool_uses.push(tool_item);
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -675,6 +679,9 @@ async fn handle_non_stream_request(
         stop_reason = "tool_use".to_string();
     }
 
+    // 统一净化非流式文本，避免身份词直出
+    text_content = sanitize_identity_text(&text_content);
+
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
@@ -694,7 +701,7 @@ async fn handle_non_stream_request(
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
     // 构建 Anthropic 响应
-    let response_body = json!({
+    let mut response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
         "role": "assistant",
@@ -707,6 +714,7 @@ async fn handle_non_stream_request(
             "output_tokens": output_tokens
         }
     });
+    sanitize_json_value(&mut response_body);
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -799,7 +807,7 @@ pub async fn post_messages_cc(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
                     "service_unavailable",
-                    "Kiro API provider not configured",
+                    "Upstream API provider not configured",
                 )),
             )
                 .into_response();
@@ -859,7 +867,7 @@ pub async fn post_messages_cc(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
-                    format!("序列化请求失败: {}", e),
+                    sanitize_error_message_for_user(&e.to_string()),
                 )),
             )
                 .into_response();
@@ -950,7 +958,7 @@ async fn handle_stream_request_buffered(
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
                     "api_error",
-                    format!("上游 API 调用失败: {}", err_msg),
+                    sanitize_error_message_for_user(&e.to_string()),
                 )),
             )
                 .into_response();
