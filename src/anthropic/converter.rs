@@ -177,6 +177,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
+    let has_tool_results = !validated_tool_results.is_empty();
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
@@ -201,7 +202,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
-    if !validated_tool_results.is_empty() {
+    if has_tool_results {
         context = context.with_tool_results(validated_tool_results);
     }
 
@@ -211,7 +212,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let content = normalize_user_content(
         text_content,
         !images.is_empty(),
-        !validated_tool_results.is_empty(),
+        has_tool_results,
     )?;
 
     let mut user_input = UserInputMessage::new(content, &model_id)
