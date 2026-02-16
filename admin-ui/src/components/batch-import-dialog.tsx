@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Upload, X, FileJson } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -53,6 +53,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  // 文件上传相关状态
+  const [isDragging, setIsDragging] = useState(false)
+  const [uploadedFileNames, setUploadedFileNames] = useState<string[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
@@ -84,7 +88,99 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    // 清除文件上传状态
+    setUploadedFileNames([])
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
   }
+
+  /**
+   * 处理上传的文件列表
+   * 读取每个 JSON 文件内容，自动合并为数组，填充到文本框
+   */
+  const handleFiles = useCallback(async (files: FileList | File[]) => {
+    const fileArray = Array.from(files)
+    // 仅接受 .json 文件
+    const jsonFiles = fileArray.filter(f => f.name.endsWith('.json'))
+    if (jsonFiles.length === 0) {
+      toast.error('请选择 .json 格式的文件')
+      return
+    }
+
+    const allCredentials: CredentialInput[] = []
+    const fileNames: string[] = []
+
+    for (const file of jsonFiles) {
+      try {
+        // 使用 FileReader 读取文件文本内容
+        const text = await file.text()
+        const parsed = JSON.parse(text)
+        // 数组则展平，单对象则包装为数组后合并
+        if (Array.isArray(parsed)) {
+          allCredentials.push(...parsed)
+        } else {
+          allCredentials.push(parsed)
+        }
+        fileNames.push(file.name)
+      } catch (error) {
+        toast.error(`文件 ${file.name} 解析失败: ${extractErrorMessage(error)}`)
+      }
+    }
+
+    if (allCredentials.length > 0) {
+      // 将合并后的凭据数组格式化后填入文本框
+      const jsonStr = allCredentials.length === 1
+        ? JSON.stringify(allCredentials[0], null, 2)
+        : JSON.stringify(allCredentials, null, 2)
+      setJsonInput(jsonStr)
+      setUploadedFileNames(fileNames)
+      toast.success(`已读取 ${fileNames.length} 个文件，共 ${allCredentials.length} 个凭据`)
+    }
+  }, [])
+
+  // 拖拽事件处理
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(true)
+  }, [])
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+  }, [])
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }, [])
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+    if (e.dataTransfer.files.length > 0) {
+      handleFiles(e.dataTransfer.files)
+    }
+  }, [handleFiles])
+
+  // 点击选择文件
+  const handleFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      handleFiles(e.target.files)
+    }
+  }, [handleFiles])
+
+  // 清除已上传的文件
+  const handleClearFiles = useCallback(() => {
+    setJsonInput('')
+    setUploadedFileNames([])
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }, [])
 
   const handleBatchImport = async () => {
     try {
@@ -316,6 +412,80 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          {/* 文件上传区域 */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">
+              上传 JSON 文件
+            </label>
+            {/* 隐藏的文件选择器 */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              multiple
+              className="hidden"
+              onChange={handleFileInputChange}
+              disabled={importing}
+            />
+            {/* 拖拽 / 点击上传区域 */}
+            <div
+              onClick={() => !importing && fileInputRef.current?.click()}
+              onDragEnter={handleDragEnter}
+              onDragLeave={handleDragLeave}
+              onDragOver={handleDragOver}
+              onDrop={handleDrop}
+              className={`flex flex-col items-center justify-center gap-2 rounded-md border-2 border-dashed p-6 cursor-pointer transition-colors ${
+                importing
+                  ? 'cursor-not-allowed opacity-50'
+                  : isDragging
+                    ? 'border-primary bg-primary/5'
+                    : 'border-muted-foreground/25 hover:border-primary/50 hover:bg-muted/50'
+              }`}
+            >
+              <Upload className={`h-8 w-8 ${isDragging ? 'text-primary' : 'text-muted-foreground'}`} />
+              <div className="text-center">
+                <p className="text-sm font-medium">
+                  {isDragging ? '松开以上传文件' : '点击选择或拖拽 JSON 文件到此处'}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  支持多个 .json 文件，自动合并
+                </p>
+              </div>
+            </div>
+
+            {/* 已上传文件列表 */}
+            {uploadedFileNames.length > 0 && (
+              <div className="flex items-center gap-2 flex-wrap">
+                {uploadedFileNames.map((name, i) => (
+                  <span key={i} className="inline-flex items-center gap-1 text-xs bg-muted px-2 py-1 rounded-md">
+                    <FileJson className="h-3 w-3" />
+                    {name}
+                  </span>
+                ))}
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); handleClearFiles() }}
+                  className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-destructive transition-colors"
+                  disabled={importing}
+                >
+                  <X className="h-3 w-3" />
+                  清除
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* 分隔线 */}
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <span className="w-full border-t" />
+            </div>
+            <div className="relative flex justify-center text-xs uppercase">
+              <span className="bg-background px-2 text-muted-foreground">或手动粘贴</span>
+            </div>
+          </div>
+
+          {/* 手动粘贴区域 */}
           <div className="space-y-2">
             <label className="text-sm font-medium">
               JSON 格式凭据
@@ -323,12 +493,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <textarea
               placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
-              onChange={(e) => setJsonInput(e.target.value)}
+              onChange={(e) => { setJsonInput(e.target.value); setUploadedFileNames([]) }}
               disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              className="flex min-h-[160px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              💡 上传文件或粘贴均可，导入时自动验活，失败的凭据会被排除
             </p>
           </div>
 
